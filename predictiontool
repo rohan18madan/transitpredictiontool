@@ -1,0 +1,307 @@
+import pandas as pd
+import numpy as np
+from xgboost import XGBRegressor
+import shap
+import pickle
+import os
+import time
+import matplotlib.pyplot as plt
+from math import radians, sin, cos, sqrt, atan2
+from openpyxl import load_workbook
+
+# Configurations and File Paths
+split_data_folder = r"C:\Capstone_Project\SplitData"
+output_folder = r"C:\Capstone_Project\OutputData"
+
+# Get the most recent trained model from the output folder
+model_input_path = max(
+    [os.path.join(output_folder, f) for f in os.listdir(output_folder) if f.startswith("transit_time_model_")],
+    key=os.path.getctime
+)
+current_time = time.strftime("%Y%m%d-%H%M%S")
+prediction_output_path = os.path.join(output_folder, f"PredictionResults_{current_time}.xlsx")
+shap_output_path = os.path.join(output_folder, f"Prediction_SHAP_Summary_{current_time}.png")
+
+print("\nUsing model:", model_input_path)
+
+# Load Prediction Datasets
+print("Loading prediction datasets...")
+df_trips = pd.read_excel(os.path.join(split_data_folder, "Prediction_Trips.xlsx"))
+df_gps = pd.read_excel(os.path.join(split_data_folder, "Prediction_GPS.xlsx"))
+df_routes = pd.read_excel(os.path.join(split_data_folder, "Capstone_Routes.xlsx"))
+
+# Clean and Prepare Routes Data
+df_routes.columns = df_routes.columns.str.strip().str.replace(" ", "").str.lower()
+df_routes.rename(columns={
+    'routenumber': 'RouteNumber',
+    'destlat': 'DestLat',
+    'destlon': 'DestLon',
+    'origlat': 'OrigLat',
+    'origlon': 'OrigLon'
+}, inplace=True)
+
+# Preprocess Trips Data
+df_trips['ScheduledStart'] = pd.to_datetime(df_trips['ScheduledStart'])
+df_trips['ScheduledEnd'] = pd.to_datetime(df_trips['ScheduledEnd'])
+df_trips['ActualStart'] = pd.to_datetime(df_trips['ActualStart'])
+if 'ActualEnd' in df_trips.columns:
+    df_trips['ActualEnd'] = pd.to_datetime(df_trips['ActualEnd'])
+
+# Preprocess GPS Data
+df_gps['DateTime'] = pd.to_datetime(df_gps['DateTime'])
+
+# Merge Datasets
+df = df_gps.merge(df_trips, on="TripID", how="left")
+df = df.merge(
+    df_routes[['RouteNumber', 'DestLat', 'DestLon', 'OrigLat', 'OrigLon']],
+    on="RouteNumber", how="left"
+)
+
+# Feature Engineering (Matching Training Script)
+# ElapsedTime: minutes from ActualStart to current GPS DateTime.
+df['ElapsedTime'] = (df['DateTime'] - df['ActualStart']).dt.total_seconds() / 60
+df['ElapsedTime'] = df['ElapsedTime'].clip(lower=0)
+
+# StartHour: hour of scheduled start.
+df['StartHour'] = df['ScheduledStart'].dt.hour
+
+# StartDayOfWeek: day of the week (Monday=0, Sunday=6).
+df['StartDayOfWeek'] = df['ScheduledStart'].dt.dayofweek
+
+# WeekendTrip: flag if the trip occurs on a weekend.
+df['WeekendTrip'] = df['StartDayOfWeek'].apply(lambda x: 1 if x >= 5 else 0)
+
+# DepartureDelay: difference between ActualStart and ScheduledStart.
+df['DepartureDelay'] = (df['ActualStart'] - df['ScheduledStart']).dt.total_seconds() / 60
+
+# ScheduledTripDuration: planned duration if ScheduledEnd exists.
+if 'ScheduledEnd' in df.columns:
+    df['ScheduledTripDuration'] = (df['ScheduledEnd'] - df['ScheduledStart']).dt.total_seconds() / 60
+    print("ScheduledTripDuration feature computed.")
+
+# LatLongVector: simplified spatial feature.
+df['LatLongVector'] = np.sqrt(df['Latitude']**2 + df['Longitude']**2)
+
+# Haversine distance function.
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth radius in kilometers.
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lon2 - lon1)
+    a = sin(dphi / 2.0)**2 + cos(phi1) * cos(phi2) * sin(dlambda / 2.0)**2
+    return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+
+df['DistanceToDestination'] = df.apply(
+    lambda row: haversine(row['Latitude'], row['Longitude'], row['DestLat'], row['DestLon'])
+    if pd.notnull(row['DestLat']) and pd.notnull(row['DestLon']) else np.nan,
+    axis=1
+)
+df['DistanceFromOrigin'] = df.apply(
+    lambda row: haversine(row['Latitude'], row['Longitude'], row['OrigLat'], row['OrigLon'])
+    if pd.notnull(row['OrigLat']) and pd.notnull(row['OrigLon']) else np.nan,
+    axis=1
+)
+
+# CarrierCode: encoded carrier name.
+if 'CarrierName' in df.columns:
+    df['CarrierCode'] = df['CarrierName'].astype('category').cat.codes
+
+# RouteNumberCode: encoded route.
+df['RouteNumberCode'] = df['RouteNumber'].astype('category').cat.codes
+
+# Fill missing values.
+df = df.ffill().bfill()
+
+# -------------------------------
+# (Optional) Trim GPS Pings for Testing
+# -------------------------------
+gps_fraction = 0.7  # Adjust fraction as needed.
+initial_count = len(df)
+
+def take_first_fraction(group):
+    n_rows = len(group)
+    cutoff = int(np.ceil(n_rows * gps_fraction))
+    return group.sort_values('DateTime').head(cutoff)
+
+df = df.groupby('TripID', group_keys=False).apply(take_first_fraction).reset_index(drop=True)
+print(f"\nGPS pings trimmed: {len(df)} pings used (originally {initial_count}), using first {gps_fraction * 100:.0f}% per trip.")
+
+# -------------------------------
+# Prepare Feature List for Prediction
+# -------------------------------
+features = [
+    'StartHour', 'StartDayOfWeek', 'WeekendTrip', 'LatLongVector',
+    'DistanceToDestination', 'DistanceFromOrigin', 'RouteNumberCode',
+    'ElapsedTime', 'DepartureDelay'
+]
+if 'ScheduledTripDuration' in df.columns:
+    features.append('ScheduledTripDuration')
+if 'CarrierCode' in df.columns:
+    features.append('CarrierCode')
+
+print("\nFeature columns used for prediction:")
+print(features)
+
+# -------------------------------
+# Load the Trained Model
+# -------------------------------
+with open(model_input_path, 'rb') as model_file:
+    model = pickle.load(model_file)
+
+# -------------------------------
+# Make Predictions
+# -------------------------------
+print("\nMaking predictions using the trained model...")
+df['PredictedRemainingTime'] = model.predict(df[features])
+
+# Compute the Predicted End Time:
+# For each TripID, use the latest GPS DateTime plus the predicted remaining time.
+latest_pings = df.sort_values('DateTime').groupby('TripID').tail(1).copy()
+latest_pings['PredictedEnd'] = latest_pings['DateTime'] + pd.to_timedelta(latest_pings['PredictedRemainingTime'], unit='m')
+latest_pings['PredictedEndFormatted'] = latest_pings['PredictedEnd'].dt.strftime("%Y-%m-%d %H:%M")
+
+# -------------------------------
+# Compute Route Completion Percentage (for Excel only)
+# -------------------------------
+latest_pings['CompletionPercentage'] = (latest_pings['ElapsedTime'] / 
+    (latest_pings['ElapsedTime'] + latest_pings['PredictedRemainingTime'])) * 100
+
+# -------------------------------
+# Flag Late Trips (Predicted End > ScheduledEnd)
+# -------------------------------
+if 'ScheduledEnd' in latest_pings.columns:
+    latest_pings['LateFlag'] = latest_pings.apply(
+        lambda row: "Yes" if (pd.notnull(row['ScheduledEnd']) and row['PredictedEnd'] > row['ScheduledEnd']) else "No",
+        axis=1
+    )
+else:
+    latest_pings['LateFlag'] = "N/A"
+
+# -------------------------------
+# Prepare Output DataFrames for Excel Export
+# -------------------------------
+# Sheet 1: All Predictions
+output_columns = ['TripID', 'RouteNumber', 'ScheduledStart', 'ActualStart']
+if 'CarrierName' in df.columns:
+    output_columns.append('CarrierName')
+if 'ScheduledEnd' in df.columns:
+    output_columns.append('ScheduledEnd')
+output_columns += ['PredictedEndFormatted', 'LateFlag', 'PredictedRemainingTime', 'CompletionPercentage']
+all_predictions = latest_pings[output_columns].reset_index(drop=True)
+for col in ['ScheduledStart', 'ActualStart', 'ScheduledEnd']:
+    if col in all_predictions.columns:
+        all_predictions[col] = all_predictions[col].dt.strftime("%Y-%m-%d %H:%M")
+
+# Sheet 2: Late Trips Only (>= 2 hours delay)
+if all_predictions['ScheduledEnd'].dtype == 'O':
+    all_predictions['ScheduledEnd'] = pd.to_datetime(all_predictions['ScheduledEnd'])
+latest_pings['ScheduledEnd'] = pd.to_datetime(latest_pings['ScheduledEnd'])
+latest_pings['DelayMinutes'] = (latest_pings['PredictedEnd'] - latest_pings['ScheduledEnd']).dt.total_seconds() / 60.0
+late_trips = latest_pings[latest_pings['DelayMinutes'] >= 120].copy()
+late_trips_output = late_trips[output_columns].reset_index(drop=True)
+for col in ['ScheduledStart', 'ActualStart', 'ScheduledEnd']:
+    if col in late_trips_output.columns:
+        late_trips_output[col] = late_trips_output[col].dt.strftime("%Y-%m-%d %H:%M")
+
+# -------------------------------
+# Sheet 3: Route Delay Summary (for Late Trips Only)
+# -------------------------------
+# First, compute overall sample size per route using latest_pings
+overall_route_summary = latest_pings.groupby('RouteNumber').agg(
+    TotalTrips=('TripID', 'count')
+).reset_index()
+
+# Next, compute the summary statistics for late trips only
+late_route_summary = late_trips.groupby('RouteNumber').agg(
+    LateTrips=('TripID', 'count'),
+    AvgDelayMinutes=('DelayMinutes', 'mean'),
+    AvgCompletion=('CompletionPercentage', 'mean')
+).reset_index()
+
+# Merge to ensure every route is included; if a route has no late trips, fill with 0.
+route_summary_full = pd.merge(overall_route_summary, late_route_summary, on='RouteNumber', how='left')
+route_summary_full['LateTrips'] = route_summary_full['LateTrips'].fillna(0)
+# (Optionally, you can leave AvgDelayMinutes and AvgCompletion as NaN if no late trips.)
+
+# -------------------------------
+# Write Multiple Sheets to Excel with Auto-Fitting Columns
+# -------------------------------
+print("\nSaving prediction results to Excel...")
+with pd.ExcelWriter(prediction_output_path, engine='openpyxl') as writer:
+    all_predictions.to_excel(writer, sheet_name="All Predictions", index=False)
+    late_trips_output.to_excel(writer, sheet_name="Late Trips", index=False)
+    route_summary_full.to_excel(writer, sheet_name="Route Delay Summary", index=False)
+    writer._save()
+
+# Auto-fit column widths using openpyxl.
+def auto_adjust_column_widths(path):
+    wb = load_workbook(path)
+    for ws in wb.worksheets:
+        for col in ws.columns:
+            max_length = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    cell_length = len(str(cell.value))
+                    if cell_length > max_length:
+                        max_length = cell_length
+                except:
+                    pass
+            adjusted_width = max_length + 2
+            ws.column_dimensions[col_letter].width = adjusted_width
+    wb.save(path)
+
+auto_adjust_column_widths(prediction_output_path)
+print("Excel file saved and columns auto-fitted:", prediction_output_path)
+
+# -------------------------------
+# Visualization: Route Delay Summary (Late Trips Only) with Sample Size
+# -------------------------------
+# Use the full route summary so that every route appears, even if it has 0 late trips.
+plt.figure(figsize=(10, 6))
+bars = plt.bar(route_summary_full['RouteNumber'].astype(str), route_summary_full['LateTrips'], color='skyblue')
+plt.xlabel("Route Number")
+plt.ylabel("Number of Late Trips (>= 2 Hours Late)")
+plt.title("Trips Predicted to be 2 Hours or More Late (by Route) with Sample Sizes")
+plt.xticks(rotation=45)
+
+# Annotate each bar with LateTrips and the total trip count from overall_route_summary.
+for index, row in route_summary_full.iterrows():
+    late_count = int(row['LateTrips'])
+    total = int(row['TotalTrips'])
+    # Use the bar's x position plus width/2 for horizontal center, and height for vertical
+    plt.text(
+        bars[index].get_x() + bars[index].get_width() / 2,
+        bars[index].get_height(),
+        f"{late_count}\n(Total: {total})",
+        ha="center",
+        va="bottom"
+    )
+
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# SHAP Analysis on a Sample of Prediction Data
+# -------------------------------
+print("\nCalculating SHAP values for predictions...")
+explainer = shap.Explainer(model)
+sample_data = df[features].sample(min(1000, len(df)), random_state=42)
+shap_values = explainer(sample_data)
+
+plt.figure()
+shap.summary_plot(shap_values, sample_data, show=False)
+plt.savefig(shap_output_path)
+plt.close()
+print("SHAP summary plot saved to:", shap_output_path)
+
+# -------------------------------
+# Auto-Open Excel and SHAP Files
+# -------------------------------
+try:
+    os.startfile(prediction_output_path)
+    os.startfile(shap_output_path)
+except Exception as e:
+    print("Auto-open not supported on this OS:", e)
+
+print("\nPrediction script completed successfully!")
