@@ -1,0 +1,87 @@
+import pandas as pd
+import numpy as np
+import os
+import time
+import subprocess
+
+#Set paths
+base_folder = r"C:\Capstone_Project"
+input_folder = os.path.join(base_folder, "InputData")
+output_folder = os.path.join(base_folder, "OutputData")
+current_time = time.strftime("%Y%m%d-%H%M%S")
+
+#Load datasets
+print("Loading datasets...")
+
+df_trips = pd.read_excel(os.path.join(input_folder, "All_trips.xlsx"), engine="openpyxl")
+df_gps = pd.read_excel(os.path.join(input_folder, "GPS_data.xlsx"), engine="openpyxl")
+df_routes = pd.read_excel(os.path.join(input_folder, "CAPSTONE_ROUTES.xlsx"), engine="openpyxl")
+
+# Clean and rename route columns
+df_routes.columns = df_routes.columns.str.strip().str.replace(" ", "").str.lower()
+df_routes.rename(columns={
+    'routenumber': 'RouteNumber',
+    'dest_lat': 'DestLat',
+    'dest_long': 'DestLon',
+    'orig_lat': 'OrigLat',
+    'orig_long': 'OrigLon'
+}, inplace=True)
+
+print("Route columns after renaming:", df_routes.columns.tolist())
+
+# Filter trips to only those in routes table
+df_trips = df_trips[df_trips['RouteNumber'].isin(df_routes['RouteNumber'])]
+
+# Ensure TripID is string to avoid Excel formatting
+df_trips['TripID'] = df_trips['TripID'].astype(str)
+df_gps['TripID'] = df_gps['TripID'].astype(str)
+
+#Proportional split by RouteNumber
+print("Performing proportional split by RouteNumber...")
+
+train_trip_ids = []
+prediction_trip_ids = []
+
+for route, group in df_trips.groupby('RouteNumber'):
+    trip_ids = group['TripID'].unique()
+    np.random.shuffle(trip_ids)
+    split_point = int(len(trip_ids) * 0.7)  # 70% training, 30% prediction
+    train_trip_ids.extend(trip_ids[:split_point])
+    prediction_trip_ids.extend(trip_ids[split_point:])
+
+print(f"Total trips: {len(df_trips['TripID'].unique())}")
+print(f"Training trips: {len(train_trip_ids)}")
+print(f"Prediction trips: {len(prediction_trip_ids)}")
+
+#Create training and prediction datasets
+
+# Trips datasets
+df_train_trips = df_trips[df_trips['TripID'].isin(train_trip_ids)].copy()
+df_prediction_trips = df_trips[df_trips['TripID'].isin(prediction_trip_ids)].copy()
+
+# GPS datasets (corresponding pings)
+df_train_gps = df_gps[df_gps['TripID'].isin(train_trip_ids)].copy()
+df_prediction_gps = df_gps[df_gps['TripID'].isin(prediction_trip_ids)].copy()
+
+#Clean RouteNumber and TripID formats to prevent Excel auto-formatting ===
+for df in [df_train_trips, df_prediction_trips, df_train_gps, df_prediction_gps, df_routes]:
+    if 'RouteNumber' in df.columns:
+        df['RouteNumber'] = df['RouteNumber'].astype(str)
+    if 'TripID' in df.columns:
+        df['TripID'] = df['TripID'].astype(str)
+
+#Export cleaned datasets
+print("Exporting split datasets to Excel...")
+
+df_train_trips.to_excel(f"{output_folder}\\Train_Trips.xlsx", index=False)
+df_prediction_trips.to_excel(f"{output_folder}\\Prediction_Trips.xlsx", index=False)
+df_train_gps.to_excel(f"{output_folder}\\Train_GPS.xlsx", index=False)
+df_prediction_gps.to_excel(f"{output_folder}\\Prediction_GPS.xlsx", index=False)
+df_routes.to_excel(f"{output_folder}\\Capstone_Routes.xlsx", index=False)
+
+print("Export completed. Files saved to OutputData folder.")
+
+# Auto-open the output folder in Windows Explorer
+subprocess.run(f'explorer \"{output_folder}\"', shell=True)
+
+print("Dataset split and export completed successfully.")
